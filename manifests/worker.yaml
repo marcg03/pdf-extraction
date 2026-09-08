@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: worker:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: LOG_LEVEL
+              value: DEBUG
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: garage-secrets
+                  key: GARAGE_DEFAULT_ACCESS_KEY
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: garage-secrets
+                  key: GARAGE_DEFAULT_SECRET_KEY
+            - name: AWS_DEFAULT_REGION
+              value: garage
+            - name: AWS_ENDPOINT_URL
+              value: http://garage:3900
+            - name: S3_BUCKET
+              value: pdfs

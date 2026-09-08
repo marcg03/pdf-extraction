@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garage
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: garage
+  template:
+    metadata:
+      labels:
+        app: garage
+    spec:
+      automountServiceAccountToken: false
+      initContainers:
+        - name: prep-garage-config
+          image: docker.io/library/busybox
+          command:
+            - /bin/sh
+            - -c
+            - |
+              sed -e "s|\${RPC_SECRET}|$RPC_SECRET|" \
+                  -e "s|\${ADMIN_TOKEN}|$ADMIN_TOKEN|" \
+                  /template/garage.toml > /config/garage.toml
+          envFrom:
+            - secretRef:
+                name: garage-secrets
+          volumeMounts:
+            - name: template
+              mountPath: /template
+            - name: config
+              mountPath: /config
+      containers:
+        - name: garage
+          image: docker.io/dxflrs/garage:v2.3.0
+          command: ["/garage", "server", "--single-node", "--default-bucket"]
+          env:
+            - name: GARAGE_CONFIG_FILE
+              value: /config/garage.toml
+            - name: GARAGE_DEFAULT_BUCKET
+              value: pdfs
+          envFrom:
+            - secretRef:
+                name: garage-secrets
+          ports:
+            - name: s3
+              containerPort: 3900
+            - name: admin
+              containerPort: 3903
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: template
+          configMap:
+            name: garage-config-template
+        - name: config
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+  namespace: default
+spec:
+  selector:
+    app: garage
+  ports:
+    - name: s3
+      port: 3900
+      targetPort: 3900
+    - name: admin
+      port: 3903
+      targetPort: 3903
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config-template
+  namespace: default
+data:
+  garage.toml: |
+    metadata_dir = "/tmp/meta"
+    data_dir = "/tmp/data"
+    db_engine = "sqlite"
+
+    replication_factor = 1
+
+    rpc_bind_addr = "[::]:3901"
+    rpc_secret = "${RPC_SECRET}"
+
+    [s3_api]
+    s3_region = "garage"
+    api_bind_addr = "[::]:3900"
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+    admin_token = "${ADMIN_TOKEN}"
