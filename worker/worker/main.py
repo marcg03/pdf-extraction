@@ -18,7 +18,7 @@ MAX_RESULT_BYTES = 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Context:
     client: valkey.Valkey
     s3: Any
