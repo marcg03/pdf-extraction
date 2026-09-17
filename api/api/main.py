@@ -1,8 +1,9 @@
 import hashlib
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 import aioboto3
@@ -11,25 +12,22 @@ import valkey.asyncio as valkey
 from botocore.config import Config
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 
+from api.utils import get_stream_name
+from api.valkey_scripts import register_enqueue_job
+
 logger = logging.getLogger(__name__)
 
 
-def get_stream_name(name: str) -> str:
-    return f"stream:{name}"
-
-
-ENQUEUE_JOB = """
-if redis.call('EXISTS', KEYS[1]) == 1 then
-  return 0
-end
-redis.call('XADD', KEYS[1], '*', 'status', 'pending')
-redis.call('XADD', KEYS[2], '*', 'key', ARGV[1])
-return 1
-"""
+@dataclass(frozen=True, slots=True)
+class AppState:
+    valkey: valkey.Valkey
+    enqueue_job: Callable[[str], Awaitable[bool]]
+    s3: Any
+    bucket: str
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     async with AsyncExitStack() as stack:
         client = await stack.enter_async_context(
             valkey.Valkey(
@@ -39,79 +37,46 @@ async def lifespan(app: FastAPI):
                 decode_responses=True,
             )
         )
-        app.state.valkey = client
-
-        _enqueue = client.register_script(ENQUEUE_JOB)
-
-        async def enqueue_job(name: str) -> bool:
-            """Return True if we created the stream, False if it already existed."""
-            return bool(await _enqueue(keys=[get_stream_name(name), "jobs"], args=[name]))
-
-        app.state.enqueue_job = enqueue_job
-
         session = aioboto3.Session()
-        app.state.s3 = await stack.enter_async_context(
+        s3 = await stack.enter_async_context(
             session.client("s3", config=Config(s3={"addressing_style": "path"}))
         )
-        app.state.bucket = os.environ.get("S3_BUCKET", "pdfs")
 
+        app.state.deps = AppState(
+            valkey=client,
+            enqueue_job=register_enqueue_job(client),
+            s3=s3,
+            bucket=os.environ.get("S3_BUCKET", "pdfs"),
+        )
         yield
 
 
-def get_valkey(request: Request) -> valkey.Valkey:
-    return request.app.state.valkey
+def get_state(request: Request) -> AppState:
+    return request.app.state.deps
 
 
-Valkey = Annotated[valkey.Valkey, Depends(get_valkey)]
-
-
-def get_enqueue_job(request: Request) -> Callable[[str], Awaitable[bool]]:
-    return request.app.state.enqueue_job
-
-
-EnqueueJob = Annotated[Callable[[str], Awaitable[bool]], Depends(get_enqueue_job)]
-
-
-def get_s3(request: Request) -> Any:
-    return request.app.state.s3
-
-
-S3 = Annotated[Any, Depends(get_s3)]
-
-
-def get_bucket(request: Request) -> str:
-    return request.app.state.bucket
-
-
-Bucket = Annotated[str, Depends(get_bucket)]
+State = Annotated[AppState, Depends(get_state)]
 
 app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/queue-extraction-job")
-async def queue_extraction_job(
-    file: UploadFile,
-    client: Valkey,
-    enqueue_job: EnqueueJob,
-    s3: S3,
-    bucket: Bucket,
-):
+async def queue_extraction_job(file: UploadFile, state: State):
     digest = hashlib.sha256()
     while chunk := await file.read(1024 * 1024):
         digest.update(chunk)
-
     key = digest.hexdigest()
 
     logger.debug("starting to upload PDF")
     await file.seek(0)
-    await s3.upload_fileobj(file.file, bucket, key)
+    await state.s3.upload_fileobj(file.file, state.bucket, key)
     logger.debug("finished uploading PDF")
 
-    await enqueue_job(name=key)
+    await state.enqueue_job(key)
 
     crt_id = "0-0"
     while True:
-        response = await client.xread(
+        response = await state.valkey.xread(
             streams={get_stream_name(key): crt_id},
             block=5000,
         )
