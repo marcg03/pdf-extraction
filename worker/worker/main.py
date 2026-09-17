@@ -2,6 +2,7 @@ import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,15 @@ from pdf2image import convert_from_path, pdfinfo_from_path
 from valkey.exceptions import ResponseError
 from valkey.typing import EncodableT, StreamIdT
 
+from worker.heartbeat import start_heartbeat
+from worker.utils import get_stream_name
+from worker.valkey_scripts import (
+    register_finish_job,
+    register_refresh_claims,
+    register_start_job,
+)
+
+HEARTBEAT_MS = 2000
 MAX_RESULT_BYTES = 1024 * 1024
 
 logger = logging.getLogger(__name__)
@@ -21,13 +31,11 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class Context:
     client: valkey.Valkey
+    start_job: Callable[[str, str, str], bool]
+    finish_job: Callable[[str, str, str, Mapping[str, str]], bool]
     s3: Any
     bucket: str
     pod_name: str
-
-
-def get_stream_name(name: str) -> str:
-    return f"stream:{name}"
 
 
 def handle(ctx: Context, key: str) -> EncodableT:
@@ -60,7 +68,9 @@ def handle(ctx: Context, key: str) -> EncodableT:
 
 def process_job(ctx: Context, key: str, job_id: StreamIdT):
     logger.debug(f"processing job ({key})")
-    ctx.client.xadd(name=get_stream_name(key), fields={"status": "in-progress"})
+    if not ctx.start_job(key=key, consumer=ctx.pod_name, job_id=job_id):
+        logger.debug(f"lost claim on job {key}, skipping")
+        return
 
     failure_reason = None
     try:
@@ -74,13 +84,24 @@ def process_job(ctx: Context, key: str, job_id: StreamIdT):
     else:
         fields = {"status": "aborted", "reason": failure_reason}
 
-    ctx.client.xadd(name=get_stream_name(key), fields=fields)
-
-    ctx.client.xack("jobs", "job-consumers", job_id)
+    ctx.finish_job(
+        key=key,
+        consumer=ctx.pod_name,
+        job_id=job_id,
+        fields=fields,
+    )
     logger.debug(f"finished job ({key})")
 
 
 def consume_jobs(ctx: Context):
+    ctx.client.xautoclaim(
+        name="jobs",
+        groupname="job-consumers",
+        consumername=ctx.pod_name,
+        min_idle_time=HEARTBEAT_MS * 10,
+        justid=True,
+    )
+
     pending_jobs = ctx.client.xreadgroup(
         groupname="job-consumers",
         consumername=ctx.pod_name,
@@ -111,13 +132,22 @@ def main() -> None:
         socket_timeout=None,
         decode_responses=True,
     )
+    start_job = register_start_job(client)
+    finish_job = register_finish_job(client)
+    refresh_claims = register_refresh_claims(client)
     s3 = boto3.client("s3", config=Config(s3={"addressing_style": "path"}))
     bucket = os.environ.get("S3_BUCKET", "pdfs")
     pod_name = os.environ.get("POD_NAME")
     if not pod_name:
         raise RuntimeError("POD_NAME is not set")
-
-    ctx = Context(client=client, s3=s3, bucket=bucket, pod_name=pod_name)
+    ctx = Context(
+        client=client,
+        start_job=start_job,
+        finish_job=finish_job,
+        s3=s3,
+        bucket=bucket,
+        pod_name=pod_name,
+    )
 
     try:
         client.xgroup_create(
@@ -132,8 +162,17 @@ def main() -> None:
             # already existing
             raise
 
-    while True:
-        consume_jobs(ctx)
+    _, stop_heartbeat = start_heartbeat(
+        refresh_claims,
+        consumer=pod_name,
+        interval_s=HEARTBEAT_MS / 1000,
+    )
+
+    try:
+        while True:
+            consume_jobs(ctx)
+    finally:
+        stop_heartbeat.set()
 
 
 if __name__ == "__main__":
